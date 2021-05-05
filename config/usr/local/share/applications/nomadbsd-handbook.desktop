@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=NomadBSD Handbook
+Exec=xdg-open /usr/share/nomadbsd-handbook/handbook.html
+Icon=help-browser
+Terminal=false
+StartupNotify=true
+Type=Application
+Categories=System;Documentation;

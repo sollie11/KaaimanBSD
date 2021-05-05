@@ -1,0 +1,1074 @@
+#!/bin/sh
+#
+# vim: set tabstop=4:
+#
+# COMMANDS
+#
+# all		 Set up base system, build and install kernel if BUILD_KERNEL is
+#			 set to YES, intall packages, ports, software from Git repos,
+#			 create uzip image, and finally build the NomadBSD image.
+#
+# init		 Create base system, add the nomad user, and copy the
+#			 configuration files to the base system.
+#
+# initbase	 Create nomad user, and copy all configuration files from
+#			 config/ and nomad/ to base system.
+#
+# cleanup	 Unmount filesystems, remove mount points, and detach md devices.
+#
+# uzip		 Create uzip image.
+#
+# patch		 Create a patch file for nomadbsd-update. Add a new record to the
+#			 patch index.
+#
+# handbook	 Build and install the NomadBSD handbook.
+#
+# image		 Build the NomadBSD image.
+#
+# ports		 Build and install all ports defined in build.cfg
+#
+# pkgs		 Install all packages from pkg.list
+#
+# git		 Install software from Git repos defined in build.cfg
+#
+# pkgcfg	 Set up configuration files and users required by installed
+#			 software packages.
+#
+# resume	 Continue where the build failed.
+#
+# setupgui	 (Re)build and (re)install nomadbsd-setup-gui
+#
+# installgui (Re)build and (re)install nomadbsd-install-gui
+#
+# unionfs	 (Re)build and (re)install unionfs-fuse
+#
+# usrcfg	 Install all files from nomad/ in ${SYSDIR]/home/nomad
+#
+# usrclean	 Remove all files from ${SYSDIR}/home/nomad
+#
+# clean		 Remove base system dir, distfiles, patch dir, and uzip images.
+#
+# dmconfig	 (Re)build and (re)install nomadbsd-dmconfig-gui
+#
+
+. ./common
+
+case ${RELEASE##*-} in
+RELEASE|BETA|RC*)
+	URL="${BASEURL}/releases";;
+*)
+	URL="${BASEURL}/snapshots";;
+esac
+
+WORKDIR="${PWD}/work"
+# Where the FreeBSD installation resides.
+SYSDIR="${WORKDIR}/sys"
+# Where bsdinstall stores fetched files.
+DISTDIR="${WORKDIR}/dists"
+PATCHDIR="${WORKDIR}/patchset"
+XORG_CONF_D="${SYSDIR}/usr/local/etc/X11/xorg.conf.d"
+FONTSDIR="${SYSDIR}/usr/local/share/fonts"
+FONTPATHS_FILE="${XORG_CONF_D}/files.conf"
+UZIP_IMAGE="${WORKDIR}/uzip_image"
+UZIP_MNT="${WORKDIR}/uzip_mnt"
+ROOTLABEL=nomadroot
+TMP_BASE_DIR="${WORKDIR}/tmpbase"
+TMP_IMAGE_NAME="${WORKDIR}/tmpbase.img"
+
+init_vars()
+{
+	local _ARCH=${ARCH}
+
+	case "${ARCH}" in
+	i386)
+		export UNAME_m=i386
+		export UNAME_p=i386
+		;;
+	amd64)
+		;;
+	mac)
+		_ARCH=amd64
+		;;
+	*)
+		echo "Invalid architecture '${ARCH}'. Must be one of i386, amd64, or mac" >&2
+		exit 1
+		;;
+	esac
+	DISTSITE=${URL}/${_ARCH}/${RELEASE}
+	KERNCONF_DIR="${SYSDIR}/usr/src/sys/${_ARCH}/conf"
+	KERNCONF_NOMADBSD="${KERNCONF_DIR}/NOMADBSD"
+	KERNCONF_GENERIC="${KERNCONF_DIR}/GENERIC"
+}
+
+_umount()
+{
+	local n=3
+	while [ $n -gt 0 ]; do
+		umount "$1" && return
+		n=$(($n - 1))
+		sleep 1
+	done
+	umount -f "$1"
+}
+
+instusrcfg()
+{
+	(cd nomad  && tar cf - .) | (cd "${SYSDIR}/usr/home/nomad" && tar xf -)
+	chroot "${SYSDIR}" sh -c 'chown -R nomad:nomad /usr/home/nomad'
+}
+
+initbase()
+{
+	chroot "${SYSDIR}" sh -c 'mount -t devfs devfs /dev'
+	chroot "${SYSDIR}" sh -c '/etc/rc.d/ldconfig start'
+	_umount "${SYSDIR}/dev"
+	if ! grep -q ^nomad "${SYSDIR}/etc/passwd"; then
+		chroot "${SYSDIR}" sh -c 'pw useradd nomad -m \
+		    -G wheel,operator,video,games -s /bin/csh'
+	fi
+	(cd config && tar cf - .) | \
+	    (cd "${SYSDIR}" && tar -xf - --uname root --gname wheel)
+	chroot "${SYSDIR}" sh -c 'cap_mkdb /etc/login.conf'
+	insthandbook
+	instusrcfg
+	if (echo ${RELEASE} | grep -q 'CURRENT'); then
+		sed -E -i '' 's/quarterly/latest/g' "${SYSDIR}/etc/pkg/FreeBSD.conf"
+		rm -f "${SYSDIR}/usr/local/etc/X11/xorg.conf.d/wacom.conf"
+	fi
+	# Set boot menu position in ${SYSDIR}/boot/lua/drawer.lua
+	re="s/^menu_position =.*$/menu_position"
+	re="${re} = {x = ${MENU_POSITION_X}, y = ${MENU_POSITION_Y}}/"
+	sed -E -i '' "${re}" "${SYSDIR}"/boot/lua/drawer.lua
+	# Disable uart.1 to prevent hangs on CherryTrail systems
+	sed -E -i '' 's/^(hint\.uart\.1.*)/#\1/g' "${SYSDIR}"/boot/device.hints
+	# Add mdns to "hosts:" line in /etc/nsswitch.conf
+	if ! grep -q 'hosts:.*mdns*' "${SYSDIR}"/etc/nsswitch.conf; then
+		sed -E -i '' 's/^(hosts:) (.*)/\1 \2 mdns/' \
+			"${SYSDIR}"/etc/nsswitch.conf
+	fi
+}
+
+mkfontpaths()
+{
+	[ ! -d "${XORG_CONF_D}" ] && mkdir -p "${XORG_CONF_D}"
+
+	for i in "${FONTSDIR}"/*; do
+		[ ! -d "$i" ] && continue
+		mkfontscale "$i/"
+		mkfontdir "$i/"
+	done
+	(echo "Section \"Files\""
+	IFS=
+	for i in "${FONTSDIR}"/*; do \
+		[ ! -d "$i" ] && continue
+		n=$(head -1 "$i/fonts.scale")
+		r="s#${SYSDIR}(/.*)\$#\\1#"
+		i=$(echo $i | sed -E $r)
+		if [ $n -gt 0 ]; then \
+			echo "  FontPath \"$i\""
+		else
+			if [ ! -z ${ns} ]; then
+				ns=$(printf "${ns}\n$i")
+			else
+				ns="$i"
+			fi
+		fi
+	done
+	echo ${ns} | while read i; do \
+		echo "  FontPath \"$i\""
+	done
+	echo "EndSection") > "${FONTPATHS_FILE}"
+}
+
+createbase()
+{
+	local version srcurl
+
+	[ ! -d "${SYSDIR}" ] && mkdir -p "${SYSDIR}" || bail
+	for d in base.txz kernel.txz src.txz; do
+		fetch ${DISTSITE}/$d -o /tmp/$d || bail
+		tar --unlink -xvpJf /tmp/$d -C "${SYSDIR}" || bail
+		rm -f /tmp/$d
+	done
+	cp /etc/resolv.conf "${SYSDIR}"/etc
+}
+
+updatebase()
+{
+	PAGER=cat freebsd-update --currently-running ${RELEASE} \
+		-f "${SYSDIR}/etc/freebsd-update.conf" -b "${SYSDIR}" \
+		-d "${SYSDIR}/var/db/freebsd-update" fetch && \
+	PAGER=cat freebsd-update --currently-running ${RELEASE} \
+		-f "${SYSDIR}/etc/freebsd-update.conf" -b "${SYSDIR}" \
+		-d "${SYSDIR}/var/db/freebsd-update" install
+}
+
+buildnvidia()
+{
+	local d v pkgname have_gsed
+
+	[ ! -d "${SYSDIR}/usr/ports" ] && mkdir "${SYSDIR}/usr/ports"
+	if ! (mount | grep -q "${SYSDIR}/usr/ports"); then
+		mount -t nullfs "${PORTSTREE}" "${SYSDIR}/usr/ports"
+	fi
+	if ! (mount | grep -q "${SYSDIR}/dev"); then
+		chroot "${SYSDIR}" sh -c 'mount -t devfs devfs /dev'
+	fi
+	# Building nvidia-driver>=410 requires textproc/gsed
+	if pkg --chroot "${SYSDIR}" info --exists textproc/gsed; then
+		have_gsed=1
+	else
+		pkg --chroot "${SYSDIR}" install -y textproc/gsed
+	fi
+	for v in 304 340 390 440; do
+		# Skip nvidia-driver-440 on i386
+		[ ${ARCH} = "i386" -a $v -eq 440 ] && continue
+		if [ $v -eq 440 ]; then
+			d="nvidia-driver"
+		else
+			d="nvidia-driver-$v"
+		fi
+		pkgname=$(cd "${PORTSTREE}/x11/$d" && make -VPKGNAME)
+		[ -f "${PKGDIR}/${pkgname}.txz" ] && continue
+		chroot "${SYSDIR}" sh -c "cd /usr/ports/x11/$d && \
+			make BATCH=1 ${NVIDIA_BUILD_OPTS} clean package" || bail
+		mkdir -p "${SYSDIR}/usr/local/nvidia/$v" 2>/dev/null
+		cat "${SYSDIR}/usr/ports/x11/$d/work/pkg/${pkgname}.txz" | \
+			(cd "${SYSDIR}/usr/local/nvidia/${v}" && tar xf -)
+		chroot "${SYSDIR}" sh -c "cd /usr/ports/x11/$d && make distclean"
+	done
+	# Remove textproc/gsed if we just installed it for building nvidia-driver
+	[ -z "${have_gsed}" ] && pkg --chroot "${SYSDIR}" delete -y textproc/gsed
+	_umount "${SYSDIR}/usr/ports"
+	_umount "${SYSDIR}/dev"
+	mkdir -p "${SYSDIR}"/nvidia/usr/local/lib/xorg/modules/drivers
+	mkdir -p "${SYSDIR}"/nvidia/usr/local/lib/xorg/modules/extensions
+
+	rm -f "${SYSDIR}/usr/local/lib/xorg/modules/drivers/nvidia_drv.so"
+	ln -sf "/nvidia/usr/local/lib/xorg/modules/drivers/nvidia_drv.so" \
+		"${SYSDIR}/usr/local/lib/xorg/modules/drivers/"
+	for l in libglx.so libglx.so.1 libglxserver_nvidia.so \
+			 libglxserver_nvidia.so.1; do
+		rm -f "${SYSDIR}/usr/local/lib/xorg/modules/extensions/$l"
+		ln -sf "/nvidia/usr/local/lib/xorg/modules/extensions/$l" \
+			"${SYSDIR}/usr/local/lib/xorg/modules/extensions/"
+	done
+}
+
+pkglist()
+{
+	if [ ${ARCH} = "i386" ]; then
+		awk '
+			!/virtualbox-ose-additions/ {
+				print $0
+			}
+		' < ${PKGLIST}
+	else
+		cat ${PKGLIST}
+	fi
+}
+
+instpkgs()
+{
+	if ! (mount | grep -q "${SYSDIR}/dev"); then
+		chroot "${SYSDIR}" sh -c 'mount -t devfs devfs /dev'
+	fi
+	export ASSUME_ALWAYS_YES=yes
+	pkglist | xargs -J% pkg -c "${SYSDIR}" install -y % || bail
+
+	# Lock all kernel module packages to prevent kernel version mismatch
+	# problems when updating packages on CURRENT.
+	if (echo ${RELEASE} | grep -q 'CURRENT'); then
+		pkg -c "${SYSDIR}" lock -y -g '*-kmod-*'
+	fi
+	_umount "${SYSDIR}/dev"
+}
+
+instgit()
+{
+	[ ! -d "${SYSDIR}/git" ] && mkdir "${SYSDIR}/git"
+	if ! (mount | grep -q "${SYSDIR}/dev"); then
+		chroot "${SYSDIR}" sh -c 'mount -t devfs devfs /dev'
+	fi
+	for r in ${GIT_REPOS}; do
+		rd=$(echo $r | sed -E 's#.*/(.*)\.git$#\1#')
+		repo_dirs="${repo_dirs} ${rd}"
+		if [ ! -d "${SYSDIR}/git/${rd}" ]; then
+			chroot "${SYSDIR}" sh -c "cd /git && git clone ${r}"
+		fi
+	done
+	for r in ${repo_dirs}; do
+		rname=$(echo $r | tr '-' '_')
+		eval build_cmd=\${${rname}_BUILD_CMD}
+		[ -z "${build_cmd}" ] && continue
+		chroot "${SYSDIR}" sh -c "cd /git/${r}; ${build_cmd}"
+	done
+	_umount "${SYSDIR}/dev"
+}
+
+postpkgcfg()
+{
+	cp "${SYSDIR}/usr/local/etc/dsbmd.conf.sample" \
+		"${SYSDIR}/usr/local/etc/dsbmd.conf"
+	if grep -q ^cups: "${SYSDIR}/etc/group"; then
+		chroot "${SYSDIR}" sh -c 'pw groupmod cups -m nomad'
+	fi
+	if grep -q ^webcamd: "${SYSDIR}/etc/group"; then
+		chroot "${SYSDIR}" sh -c 'pw groupmod webcamd -m nomad'
+	fi
+	# Remove tesserac-data which uses ~1G.
+	rm -rf "${SYSDIR}"/usr/local/share/tessdata/*
+
+	# Remove desktop files for LXDE and Xfce preferred applications
+	rm -f "${SYSDIR}"/usr/local/share/applications/exo-*.desktop
+	rm -f "${SYSDIR}"/usr/local/share/applications/libfm-pref-apps.desktop
+
+	# Remove useless Xfce desktop file
+	rm -f "${SYSDIR}"/usr/local/share/applications/xfce4-about.desktop
+
+	# Remove Networkmgr's netcardmgr script which messes with our auto-
+	# configured network interfaces in /etc/rc.conf.
+	rm -f "${SYSDIR}"/usr/local/bin/netcardmgr
+
+	# Use the Papirus terminal icon as default icon for Sakura
+	cp "${SYSDIR}"/usr/local/share/icons/Papirus/48x48/apps/utilities-terminal.svg \
+	"${SYSDIR}"/usr/local/share/pixmaps/terminal.svg
+	(cd config/usr/local/share/slim && tar cf - .) | \
+	    (cd "${SYSDIR}"/usr/local/share/slim && tar xf -)
+	mkfontpaths
+}
+
+#
+# Check if the port options of an installed package matches
+# the given options. Options are defined as follows:
+# "OPT1=<on|off> OPT2=<on|off> ... OPTn=<on|off>"
+# Return != 0 if the value of one of the given options do not
+# match the returned (pkg query) options.
+#
+check_port_opts()
+{
+	local port=$1
+	local opts=$2
+	local curopts=$(pkg -c ${SYSDIR} query -i "%Ok=%Ov" ${port})
+
+	for o in ${opts}; do
+		if ! (echo ${curopts} | grep -q $o); then
+			return 1
+		fi
+	done
+	return 0
+}
+
+#
+# Creates a port's _SET and _UNSET make variables from a list
+# of OPT=<on|off> pairs.
+#
+# Example: port_popts cat/fooport "FOO=on BAR=off BAZ=on"
+#          becomes cat_fooport_SET="FOO BAZ" cat_fooport_UNSET="BAR"
+#
+port_opts()
+{
+	local popts=$2
+	local pname=$(echo $1 | tr '/' '_')
+
+	echo ${popts} | tr ' ' '\n' | awk -v pname=${pname} '{
+		split($0, a, /=/);
+		if (a[2] ~ /on/) {
+			set_vars = sprintf("%s%s%s", set_vars,
+			    set_vars ? " " : "", a[1]);
+		} else if (a[2] ~ /off/) {
+			unset_vars = sprintf("%s%s%s", unset_vars,
+			    unset_vars ? " " : "", a[1]);
+		}
+	}
+	END {
+		if (set_vars)
+			printf("%s_SET=\"%s\" ", pname, set_vars);
+		if (unset_vars)
+			printf("%s_UNSET=\"%s\"", pname, unset_vars);
+	}'
+}
+
+instports()
+{
+	[ ! -d "${SYSDIR}/usr/ports" ] && mkdir "${SYSDIR}/usr/ports"
+	if ! (mount | grep -q "${SYSDIR}/usr/ports"); then
+		mount -t nullfs "${PORTSTREE}" "${SYSDIR}/usr/ports"
+	fi
+	if ! (mount | grep -q "${SYSDIR}/dev"); then
+		chroot "${SYSDIR}" sh -c 'mount -t devfs devfs /dev'
+	fi
+	#
+	# We need devel/autoconf and devel/automake to build
+	# sysutils/fusefs-jmtpfs
+	#
+	if pkg --chroot "${SYSDIR}" info --exists devel/autoconf; then
+		have_autoconf=1
+	else
+		pkg --chroot "${SYSDIR}" install -y devel/autoconf
+	fi
+	if pkg --chroot "${SYSDIR}" info --exists devel/automake; then
+		have_automake=1
+	else
+		pkg --chroot "${SYSDIR}" install -y devel/automake
+	fi
+	for p in ${PORTSLIST}; do
+		echo "Checking whether $p is already installed" >&2
+		pname=$(echo $p | cut -d/ -f2 | tr '.-' '__')
+		eval popts=\${${pname}_OPTS}
+		if pkg --chroot "${SYSDIR}" info --exists $p; then
+			if check_port_opts $p "${popts}"; then
+				# Port options not changed. Check whether the ports
+				# version is newer than the installed version.
+				p1=$(pkg --chroot "${SYSDIR}" info $p | head -1)
+				p2=$(cd ${SYSDIR}/usr/ports/$p && make -VPKGNAME);
+				result=$(pkg version -t $p2 $p1)
+				[ $result = '<' -o $result = '=' ] && continue
+				echo "Building newer version from ports ..."
+			else
+				echo "Options of installed package do not match."
+			fi
+		fi
+		echo "Building $p ..." >&2
+		local opts=$(port_opts $p "${popts}")
+		chroot "${SYSDIR}" sh -c "cd /usr/ports/$p && \
+			make BATCH=1 ${opts} clean deinstall install" || bail
+	done
+	# Lock all kernel module packages to prevent kernel version mismatch
+	# problems when updating packages on CURRENT.
+	if (echo ${RELEASE} | grep -q 'CURRENT'); then
+		pkg -c "${SYSDIR}" lock -y -g '*-kmod-*'
+	fi
+	# Delete packages needed to build the ports
+	if [ -z "$have_autoconf" ]; then
+		pkg -c "${SYSDIR}" delete -y devel/autoconf
+	fi
+	if [ -z "$have_automake" ]; then
+		pkg -c "${SYSDIR}" delete -y devel/autoconf
+	fi
+	pkg -c "${SYSDIR}" autoremove -y
+
+	_umount "${SYSDIR}/usr/ports"
+	_umount "${SYSDIR}/dev"
+}
+
+buildkernel()
+{
+	local makeopts="KERNCONF=NOMADBSD ${BUILDKERNEL_OPTS}"
+	      makeopts="${makeopts} WITHOUT_MODULES=\"${WITHOUT_KMODS}\""
+	local regx="/DEBUG=-g/d; /WITH_CTF=1/d; /^ident.*GENERIC/d;"
+	sed -e "${regx}" < ${KERNCONF_GENERIC} > ${KERNCONF_NOMADBSD}
+	KERNELOPTS >> ${KERNCONF_NOMADBSD}
+	if [ "${ARCH}" = "i386" ]; then
+		makeopts="${makeopts} LD=ld.lld"
+	fi
+	for i in $(pwd)/patch/usr/src/*.diff; do
+		(cd "${SYSDIR}"/usr/src && patch -N < $i)
+	done
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+	    cd /usr/src && make ${makeopts} kernel" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+instsrcdist()
+{
+	BSDINSTALL_DISTDIR="${DISTDIR}" DISTRIBUTIONS=src.txz \
+	    BSDINSTALL_DISTSITE=${DISTSITE} bsdinstall distfetch
+	BSDINSTALL_DISTDIR="${DISTDIR}" BSDINSTALL_CHROOT="${SYSDIR}" \
+	    DISTRIBUTIONS=src.txz bsdinstall distextract
+}
+
+estimgsize() {
+	local rootfs=$(mount -p | awk '$2 == "/" {print $3}')
+	if [ "${rootfs}" = "zfs" ]; then
+	    du_extra_args="-A"
+	fi
+	nfiles=$(find "$1" | wc -l)
+	wasted=$(($nfiles * (${FRAGSIZE} / 2) / (1024 * 1024)))
+	size=$(du -mc ${du_extra_args} -B ${FRAGSIZE} "$1" | tail -1 | cut -f 1)
+	size=$((${size} + ${wasted}))
+	echo ${size}
+}
+
+createtmpimage()
+{
+	local mddev maxsize
+
+	touch ${TMP_IMAGE_NAME}
+	maxsize=$(echo "scale=0; ${MEDIASIZE} * 1000^3 / 1024" | bc)
+	mddev=$(mdconfig -a -t vnode -f ${TMP_IMAGE_NAME} -s ${maxsize}k)
+	[ $? -ne 0 ] && bail
+	gpart destroy -F ${mddev}
+	gpart create -s gpt ${mddev} || bail
+	gpart add -t freebsd-ufs ${mddev} || bail
+	newfs -E -U -O 1 -o time -b ${blksize} -f ${FRAGSIZE} \
+	    -m ${UFS_MINFREE} /dev/${mddev}p1 || bail
+	mdconfig -d -u ${mddev}
+}
+
+#
+# Returns the shortened, current git commit ID, or the tag if given.
+#
+get_version()
+{
+	git log --oneline --decorate=full | head -1 | awk -F'[ \t()]+' '{
+		ID=$1;
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /tags/) {
+				n = split($i, a, "/")
+				print a[n];
+				exit(0);
+			}
+		}
+		print ID;
+	}'
+}
+
+createimage()
+{
+	local tmpimgdev used pn MNT
+
+	MNT="${WORKDIR}/mnt"
+
+	IMAGE_NAME=$(imagename)
+
+	if [ -f ${IMAGE_NAME} ]; then
+		echo "${IMAGE_NAME} already exists" >&2
+		bail
+	fi
+	if [ ! -f ${UZIP_IMAGE}.uzip ]; then
+		echo "${UZIP_IMAGE}.uzip does not exist." >&2
+		bail
+	fi
+	if [ "${rootfs}" = "zfs" ]; then
+	    du_extra_args="-A"
+	fi
+	blksize=$((${FRAGSIZE} * 8))
+	uzipsz=$(du -m ${du_extra_args} ${UZIP_IMAGE}.uzip | cut -f1)
+
+	[ ! -d "${TMP_BASE_DIR}" ] && mkdir -p ${TMP_BASE_DIR}
+
+	createtmpimage
+	tmpimgdev=$(mdconfig -a -t vnode -f ${TMP_IMAGE_NAME})
+	[ $? -ne 0 ] && bail
+	mount /dev/${tmpimgdev}p1 ${TMP_BASE_DIR} || bail
+
+	get_version > ${TMP_BASE_DIR}/VERSION
+
+	(cd "${SYSDIR}" && rm -rf var/tmp/*; rm -rf tmp/*)
+	(cd "${SYSDIR}" && tar -cf -       \
+		--exclude '^boot/kernel.old'   \
+	    --exclude '^git*'              \
+	    --exclude '^pkgs/*'            \
+	    --exclude '^usr/obj*'          \
+	    --exclude '^usr/src*'          \
+	    --exclude '^usr/ports*'        \
+	    --exclude '^usr/local'         \
+	    --exclude '^home*'             \
+	    --exclude '^usr/home*'         \
+	    --exclude '^var/cache/pkg*'    \
+	    --exclude '^var/db/portsnap/*' \
+	    --exclude '^var/db/ports/*'    \
+	    --exclude '^var/db/*'		   \
+		--exclude '^var/log/*' .) | (cd ${TMP_BASE_DIR} && tar pxf -) || bail
+	mkdir ${TMP_BASE_DIR}/var/db
+	mkdir ${TMP_BASE_DIR}/var/log
+	mkdir ${TMP_BASE_DIR}/usr/share/nomadbsd
+	mkdir ${TMP_BASE_DIR}/compat
+	(cd "${SYSDIR}/usr/home/nomad" && tar cfz - .) > \
+		${TMP_BASE_DIR}/usr/share/nomadbsd/home.nomad.tgz
+	mkdir ${TMP_BASE_DIR}/usr.local.etc
+	(cd "${SYSDIR}/usr/local/etc" && tar cf - .) | \
+ 	    (cd ${TMP_BASE_DIR}/usr.local.etc && tar vpxf -) || bail
+	mkdir ${TMP_BASE_DIR}/uzip; mkdir ${TMP_BASE_DIR}/usr/local
+	cp ${UZIP_IMAGE}.uzip ${TMP_BASE_DIR}/uzip/usr.local.uzip || bail
+	if [ "${USE_UNIONFS_FUSE}" = "YES" ]; then
+		mkdir -p ${TMP_BASE_DIR}/unionfs/usr/local || bail
+		mv ${TMP_BASE_DIR}/etc/rc.d/mount_uzip.fuse \
+				${TMP_BASE_DIR}/etc/rc.d/mount_uzip || bail
+		mv ${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset.fuse \
+				${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset || bail
+		rmdir ${TMP_BASE_DIR}/usr/local || bail
+		ln -s /unionfs/usr/local ${TMP_BASE_DIR}/usr/local || bail
+		awk '{
+			if (/^# Insert other /) {
+				print $0;
+				print "/etc/rc.d/mount_uzip stop"
+			} else
+				print $0
+		}' "${SYSDIR}/etc/rc.shutdown" > ${TMP_BASE_DIR}/etc/rc.shutdown
+	else
+		rm -f ${TMP_BASE_DIR}/etc/rc.d/mount_uzip.fuse || bail
+		rm -f ${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset.fuse || bail
+	fi
+	rm -rf "${TMP_BASE_DIR}/root/.subversion"
+	if [ ${ARCH} = "mac" ]; then
+		# echo wsp_load=\"YES\" >> ${TMP_BASE_DIR}/boot/loader.conf
+		for i in ${TMP_BASE_DIR}/usr/libexec/nomadbsd-*.mac; do
+			mv $i ${i%.mac}
+		done
+		if [ "${USE_UNIONFS_FUSE}" = "YES" ]; then
+			mv ${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset.mac.fuse \
+				${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset || bail
+		else
+			rm -f ${TMP_BASE_DIR}/usr/libexec/nomadbsd-reset.mac.fuse
+		fi
+		sed -i '' -E "s#@ROOTDEV@#/dev/gpt/${ROOTLABEL}#" \
+			${TMP_BASE_DIR}/etc/fstab
+	else
+		rm -f ${TMP_BASE_DIR}/usr/libexec/nomadbsd-*.mac
+		sed -i '' -E "s#@ROOTDEV@#/dev/label/${ROOTLABEL}#" \
+			${TMP_BASE_DIR}/etc/fstab
+	fi
+	(cd ${TMP_BASE_DIR} && \
+		tar cfJ usr/share/nomadbsd/nomadbsd-backup.tar.xz \
+			etc root var usr.local.etc) || bail
+	(cd ${SYSDIR} && \
+		tar cfJ ${TMP_BASE_DIR}/usr/share/nomadbsd/var.db.tar.xz \
+			var/db || bail)
+	used=$(df -m /dev/${tmpimgdev}p1 | tail -1 | awk -F" " '{print $3}')
+	basesz=$((100 * (${BASEFS_EXTRA} + ${used}) / (100 - (${UFS_MINFREE} + ${UFS_OVERHEAD}))))
+	touch ${IMAGE_NAME}
+	maxsize=$(echo "scale=0; ${MEDIASIZE} * 1000^3 / 1024" | bc)
+	mddev=$(mdconfig -a -t vnode -f ${IMAGE_NAME} -s ${maxsize}k)
+	[ $? -ne 0 ] && bail
+	dd if=/dev/zero of=/dev/${mddev} bs=1M 2>/dev/null
+	[ ! -d "${MNT}" ] && mkdir -p "${MNT}"
+	pn=0
+	if [ "${ARCH}" != "mac" ]; then
+		dd if=/dev/zero of=/dev/${mddev} bs=1M count=100
+		gpart create -s mbr ${mddev}
+		if [ "${ARCH}" != "i386" ]; then
+			gpart add -a 1m -t efi -b 0 -s 40M ${mddev}
+			pn=$(($pn + 1))
+			newfs_msdos -F 32 -c 1 /dev/${mddev}s${pn} || bail
+			mount -t msdosfs /dev/${mddev}s${pn} "${MNT}" || bail
+			mkdir -p "${MNT}/EFI/BOOT" || bail
+			if (echo ${RELEASE} | grep -q 'CURRENT'); then
+				cp ${SYSDIR}/boot/loader.efi "${MNT}/EFI/BOOT/BOOTX64.EFI" || bail
+			else
+				cp ${SYSDIR}/boot/boot1.efi "${MNT}/EFI/BOOT/BOOTX64.EFI" || bail
+			fi
+			_umount "${MNT}"
+		fi
+		gpart add -t freebsd -a 1m -s ${basesz}m ${mddev}
+		pn=$(($pn + 1))
+		gpart create -s bsd ${mddev}s${pn}
+		gpart bootcode -b "${SYSDIR}/boot/mbr" ${mddev}
+		gpart bootcode -b "${SYSDIR}/boot/boot" ${mddev}s${pn}
+		gpart add -t freebsd-ufs -a 1m -b 16 ${mddev}s${pn} || bail
+		gpart set -a active -i ${pn} ${mddev}
+		newfs -t -E -U -O 1 -o time -b ${blksize} -f ${FRAGSIZE} \
+			  -m ${UFS_MINFREE} /dev/${mddev}s${pn}a || bail
+		mount /dev/${mddev}s${pn}a "${MNT}" || bail
+	else
+		gpart create -s gpt ${mddev} || bail
+		gpart add -t freebsd-boot -l gpboot -b 40 -s 512K ${mddev} || bail
+		pn=$((${pn} + 1))
+		gpart bootcode -b /boot/pmbr -p /boot/gptboot -i ${pn} ${mddev} || bail
+		gpart add -t efi -a 1m -l gpefiboot -s 200m ${mddev} || bail
+		pn=$((${pn} + 1))
+		newfs_msdos -F 32 -c 1 /dev/${mddev}p${pn} || bail
+		mount -t msdosfs /dev/${mddev}p${pn} "${MNT}" || bail
+		mkdir -p "${MNT}/EFI/BOOT" || bail
+		if (echo ${RELEASE} | grep -q 'CURRENT'); then
+			cp ${SYSDIR}/boot/loader.efi "${MNT}/EFI/BOOT/BOOTX64.EFI" || bail
+		else
+			cp ${SYSDIR}/boot/boot1.efi "${MNT}/EFI/BOOT/BOOTX64.EFI" || bail
+		fi
+		_umount "${MNT}"
+		gpart add -t freebsd-ufs -a 1m -l ${ROOTLABEL} -s ${basesz}m ${mddev} || bail
+		pn=$((${pn} + 1))
+		newfs -t -E -U -O 1 -o time -b ${blksize} -f ${FRAGSIZE} \
+		      -m ${UFS_MINFREE} /dev/${mddev}p${pn} || bail
+		mount /dev/${mddev}p${pn} "${MNT}" || bail
+	fi
+	(cd ${TMP_BASE_DIR} && tar cf - .) | (cd "${MNT}" && tar pxf -) || bail
+	_umount "${MNT}"
+	if [ "${ARCH}" != "mac" ]; then
+		glabel label nomadroot /dev/${mddev}s${pn}a || bail
+	fi
+	mdconfig -d -u ${mddev}
+	rmdir "${MNT}"
+	chflags -R noschg,nosunlnk ${TMP_BASE_DIR}
+	_umount ${TMP_BASE_DIR} || bail
+	mdconfig -d -u ${tmpimgdev}
+	rm -f ${TMP_IMAGE_NAME}
+	rm -rf ${TMP_BASE_DIR}
+}
+
+createuzip()
+{
+	if [ -f ${UZIP_IMAGE}.uzip ]; then
+		echo "${UZIP_IMAGE}.uzip already exists" >&2
+		bail
+	fi
+	if [ -f ${UZIP_IMAGE}.img ]; then
+		echo "${UZIP_IMAGE}.img already exists" >&2
+		bail
+	fi
+	blksize=$((${FRAGSIZE} * 8))
+	uzipsz=$(estimgsize "${SYSDIR}/usr/local")
+
+	touch ${UZIP_IMAGE}.img
+	mddev=$(mdconfig -a -t vnode -f ${UZIP_IMAGE}.img -s ${uzipsz}m) || bail
+	newfs -O 1 -o space -m 0 -b ${blksize} -f ${FRAGSIZE} \
+	    /dev/${mddev} || bail
+	[ ! -d "${UZIP_MNT}" ] && mkdir "${UZIP_MNT}"
+	mount /dev/${mddev} "${UZIP_MNT}" || bail
+	(cd "${SYSDIR}/usr/local" && \
+		find . -not \( -path "./etc" -or -path "./etc/*" \) | \
+		cpio -pdmu "${UZIP_MNT}")
+	(cd "${UZIP_MNT}" && ln -s /usr.local.etc etc)
+	_umount "${UZIP_MNT}"
+	mdconfig -d -u ${mddev}
+	rmdir "${UZIP_MNT}"
+	mversion=$(freebsd-version -u | sed -E 's/^([0-9]+).*/\1/')
+	if [ "${mversion}" = "13" ]; then
+		mkuzip -Z -j ${MKUZIP_JOBS} -d -s ${UZIP_CLUSTERSZ} -A zstd -C 19 \
+				-o ${UZIP_IMAGE}.uzip ${UZIP_IMAGE}.img
+	else
+		mkuzip -Z -j ${MKUZIP_JOBS} -d -s ${UZIP_CLUSTERSZ} \
+				-o ${UZIP_IMAGE}.uzip ${UZIP_IMAGE}.img
+	fi
+}
+
+createpatch()
+{
+	[ ! -d "${PATCHDIR}" ] && mkdir -p "${PATCHDIR}" || bail
+	if [ -z "${PATCHVERSION}" ]; then
+		echo "PATCHVERSION not defined" >&2
+		bail
+	fi
+	(cd config && tar cf - .) | (cd "${PATCHDIR}" && tar xf -)
+	echo "${PATCHVERSION}" > "${PATCHDIR}/VERSION"
+	mkdir "${PATCHDIR}/home"
+	(tar cf - nomad) | (cd "${PATCHDIR}/home" && tar xf -)
+	(cd "${PATCHDIR}" && find . -type f -exec md5 {} \; > \
+	    "$(pwd)/nomadbsd-patch-${PATCHVERSION}.files")
+	(cd "${PATCHDIR}" && \
+	    tar cfz "$(pwd)/nomadbsd-patch-${PATCHVERSION}.tgz" .)
+	cs=$(sha256 nomadbsd-patch-${PATCHVERSION}.tgz | \
+	    cut -d'=' -f2 | tr -d ' ')
+	r="version=${PATCHVERSION}"
+	r="${r}:archive=nomadbsd-patch-${PATCHVERSION}.tgz"
+	r="${r}:archivecs=${cs}"
+	r="${r}:flist=nomadbsd-patch-${PATCHVERSION}.files"
+	echo ${r} >> nomadbsd-patch.index
+}
+
+build_unionfs()
+{
+	[ "${USE_UNIONFS_FUSE}" != "YES" ] && return
+
+	if [ ! -d "${SYSDIR}/tmp/unionfs-fuse" ]; then
+		(cd "${SYSDIR}/tmp" && \
+			git clone https://github.com/nomadbsd/unionfs-fuse) || bail
+	else
+		(cd "${SYSDIR}/tmp/unionfs-fuse" && git pull) || bail
+	fi
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/unionfs-fuse && cmake . && make" || bail
+	_umount "${SYSDIR}/dev"
+	cp "${SYSDIR}/tmp/unionfs-fuse/src/unionfs" "${SYSDIR}/usr/bin" || bail
+	cp "${SYSDIR}/tmp/unionfs-fuse/src/unionfsctl" "${SYSDIR}/usr/bin" || bail
+	cp "${SYSDIR}/tmp/unionfs-fuse/LICENSE" \
+		"${SYSDIR}/usr/local/share/licenses/unionfs-fuse" || bail
+}
+
+build_setupgui()
+{
+	if [ "${ARCH}" = "mac" ]; then
+		QMAKE_VARS="MAC=1"
+	else
+		QMAKE_VARS=""
+	fi
+	cp -a src/nomadbsd-setup-gui "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/nomadbsd-setup-gui && make distclean; \
+		qmake ${QMAKE_VARS} && make && make install" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+build_installgui()
+{
+	if [ "${ARCH}" = "mac" ]; then
+		QMAKE_VARS="MAC=1"
+	else
+		QMAKE_VARS=""
+	fi
+	cp -a src/nomadbsd-install-gui "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/nomadbsd-install-gui && make distclean; \
+		qmake ${QMAKE_VARS} && make && make install" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+build_addusergui()
+{
+	cp -a src/nomadbsd-adduser-gui "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/nomadbsd-adduser-gui && make distclean; \
+		qmake && make && make install" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+build_dmconfig()
+{
+	cp -a src/nomadbsd-dmconfig "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/nomadbsd-dmconfig && make distclean; \
+		qmake && make && make install" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+build_chusr()
+{
+	required_pkgs="py37-qt5-core py37-qt5-xml py37-qt5-gui py37-qt5-widgets"
+	cp -a src/nomadbsd-chusr "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" \
+			sh -c "cd /tmp/nomadbsd-chusr && make install" || bail
+	for i in ${required_pkgs}; do
+		if ! pkg -c "${SYSDIR}" info --exists $i; then
+			pkg -c "${SYSDIR}" install -y $i
+		fi
+	done
+}
+
+build_lbi_gui()
+{
+	cp -a src/lbi-gui "${SYSDIR}/tmp/"
+	chroot "${SYSDIR}" sh -c "mount -t devfs devfs /dev; \
+		cd /tmp/lbi-gui && make && make install" || bail
+	_umount "${SYSDIR}/dev"
+}
+
+insthandbook()
+{
+	local i
+
+	if [ ! -d "${WORKDIR}/handbook" ]; then
+		git clone https://github.com/nomadbsd/handbook.git \
+			"${WORKDIR}/handbook"
+	else
+		(cd "${WORKDIR}/handbook" && git pull)
+	fi
+	(cd "${WORKDIR}/handbook" && make)
+	if [ ! -d "${SYSDIR}/usr/share/nomadbsd-handbook" ]; then
+		mkdir "${SYSDIR}/usr/share/nomadbsd-handbook"
+	fi
+	for i in style.css handbook.html images; do
+		cp -r "${WORKDIR}/handbook/$i" "${SYSDIR}/usr/share/nomadbsd-handbook/"
+	done
+}
+
+cleanup()
+{
+	if (mount | grep "${SYSDIR}/usr/ports"); then
+		_umount "${SYSDIR}/usr/ports"
+	fi
+	if (mount | grep "${SYSDIR}/dev"); then
+		_umount "${SYSDIR}/dev"
+	fi
+	if (mount | grep "${UZIP_MNT}"); then
+		_umount "${UZIP_MNT}"
+	fi
+	if (mount | grep "${WORKDIR}/mnt"); then
+		_umount "${WORDIR}/mnt"
+	fi
+	if (mount | grep "${TMP_BASE_DIR}" || \
+	    mount | grep "${TMP_BASE_DIR}"); then
+		_umount ${TMP_BASE_DIR}
+	fi
+	rmdir "${UZIP_MNT}" "${WORKDIR}/mnt" ./${TMP_BASE_DIR} 2>/dev/null
+	for i in $(mdconfig -l); do
+		mdconfig -d -u $i
+	done
+	rm -f "${TMP_IMAGE_NAME}" 2>/dev/null
+}
+
+bail()
+{
+	cleanup
+	exit 1
+}
+
+usrclean()
+{
+	rm -rf "${SYSDIR}/home/nomad/"*
+	rm -rf "${SYSDIR}/home/nomad/".* 2>/dev/null
+}
+
+baseclean()
+{
+	chflags -R noschg,nosunlnk "${SYSDIR}"
+	rm -rf "${SYSDIR}"
+}
+
+allclean()
+{
+	baseclean
+	rm -rf "${WORKDIR}"
+}
+
+_init()
+{
+	createbase
+	initbase
+}
+
+save_stage()
+{
+	echo "ARCH=${ARCH}" > ".failed-stage"
+	echo "__stage=$1" >> ".failed-stage"
+}
+
+restore_stage()
+{
+	. ./.failed-stage
+}
+
+all()
+{
+	local i stages
+
+	stages="instpkgs instgit build_setupgui build_installgui build_addusergui"
+	stages="${stages} build_dmconfig build_chusr build_lbi_gui build_unionfs"
+	stages="${stages} instports buildnvidia postpkgcfg createuzip"
+	stages="${stages} createimage cleanup"
+	_init
+	# Do not run freebsd-update on STABLE or CURRENT.
+	if ! (echo ${RELEASE} | grep -Eq 'STABLE|CURRENT'); then
+		save_stage updatebase
+		updatebase
+	fi 
+	if [ ! -z "${BUILD_KERNEL}" ]; then
+		case ${BUILD_KERNEL} in
+		[yY][eE][sS])
+			save_stage buildkernel
+			buildkernel
+			;;
+		esac
+	fi
+	for i in ${stages}; do
+		save_stage "$i"
+		$i
+	done
+	rm -f ".failed-stage"
+}
+
+resumebuild()
+{
+	stages="updatebase buildkernel instpkgs instgit build_setupgui"
+	stages="${stages} build_installgui build_addusergui"
+	stages="${stages} build_dmconfig build_chusr build_lbi_gui build_unionfs"
+	stages="${stages} instports buildnvidia postpkgcfg createuzip"
+	stages="${stages} createimage cleanup"
+
+	stage_found=0
+	restore_stage
+	init_vars
+	failed_stage=$__stage
+	if [ -z "${failed_stage}" ]; then
+		echo "There is nothing to continue" >&2
+		exit 1
+	fi
+	for i in ${stages}; do
+		if  [ ${stage_found} -eq 1 ]; then
+			save_stage "$i"
+			$i
+		elif [ "${failed_stage}" = $i ]; then
+			stage_found=1
+			$i
+		fi
+	done
+	rm -f ".failed-stage"
+}
+
+usage()
+{
+	echo "Usage: build cmd ..."
+	echo "       build -h"
+	exit 1
+}
+
+help()
+{
+	less build.hlp
+	exit 0
+}
+
+[ $# -lt 1 ] && usage
+
+if ! which mkfontscale >/dev/null;  then
+	echo "Please install x11-fonts/mkfontscale"
+	exit 1
+fi
+if ! which markdown >/dev/null; then
+	echo "Please install textproc/markdown"
+	exit 1
+fi
+if ! which git >/dev/null; then
+	echo "Please install devel/git"
+	exit 1
+fi
+if [ ! -f /usr/ports/Makefile ]; then
+	echo "Please install the FreeBSD ports tree under /usr/ports"
+	exit 1
+fi
+
+trap bail SIGINT SIGTERM SIGHUP
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-a)
+		shift
+		[ $# -eq 0 ] && usage
+		ARCH=$1
+		;;
+	-h)
+		help;;
+	-*)
+		echo "Invalid option '$1'" >&2
+		usage
+		;;
+	*)
+		break
+		;;
+	esac
+	shift
+done
+
+init_vars
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	all)		all;;
+	clean)		allclean;;
+	cleanup)	cleanup;;
+	git)		instgit;;
+	handbook)	insthandbook;;
+	image)		createimage;;
+	init)		_init;;
+	initbase)	initbase;;
+	kernel)		buildkernel;;
+	patch)		createpatch;;
+	pkgcfg)		postpkgcfg;;
+	pkgs)		instpkgs;;
+	ports)		instports;;
+	resume)		resumebuild;;
+	setupgui)	build_setupgui;;
+	installgui) build_installgui;;
+	addusergui)	build_addusergui;;
+	dmconfig)	build_dmconfig;;
+	chusr)		build_chusr;;
+	src)		instsrcdist;;
+	unionfs)	build_unionfs;;
+	uzip)		createuzip;;
+	usrcfg)		instusrcfg;;
+	usrclean)	usrclean;;
+	update)		updatebase;;
+	*)			usage;;
+	esac
+	shift
+done

@@ -1,0 +1,39 @@
+#!/bin/sh
+
+# PROVIDE: init_vbox
+# REQUIRE: DAEMON
+# BEFORE: LOGIN
+
+. /etc/rc.subr
+
+init_vbox_enable=${init_vbox_enable-"NO"}
+
+name="init_vbox"
+rcvar="init_vbox_enable"
+start_cmd="${name}_start"
+
+init_vbox_start() {
+	if kenv smbios.system.product | grep -i -q virtualbox; then
+		#
+		# We are running in VirtualBox
+		#
+		case "${vboxguest_enable}" in
+		[Yy][eE][sS])
+			;;
+		*)
+			service vboxguest onestart
+			;;
+		esac
+		case "${vboxservice_enable}" in
+		[Yy][eE][sS])
+			;;
+		*)
+			service vboxservice onestart
+			;;
+		esac
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"
+

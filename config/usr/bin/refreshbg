@@ -1,0 +1,11 @@
+#!/bin/sh
+
+xev -root -event randr | awk '
+	BEGIN {
+		system("~/.fehbg");
+	}
+	/RRScreenChangeNotify/ {
+		system("~/.fehbg");
+	}
+'
+

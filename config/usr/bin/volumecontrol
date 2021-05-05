@@ -1,0 +1,93 @@
+#!/bin/sh
+
+# Copyright (c) 2020 The NomadBSD Project. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+mixer_bin=/usr/sbin/mixer
+dunstify_bin=/usr/local/bin/dunstify
+oldvalue_path=/var/tmp/volumecontrol_oldvalue.$(id -un)
+
+# timeout in seconds
+notify_timeout=1
+volume_step=5
+
+dunstify_id=3728
+
+iconSound="audio-volume-high"
+iconMuted="audio-volume-muted"
+
+get_volume() {
+  ${mixer_bin} vol | cut -d: -f2
+}
+
+is_muted() {
+  [ $(get_volume) -eq 0 ] && true || false
+}
+
+set_volume() {
+  ${mixer_bin} vol ${1} >/dev/null
+}
+
+send_notification() {
+  volume=$(get_volume)
+  if is_muted ; then
+    ${dunstify_bin} -i $iconMuted -r ${dunstify_id} -t $((notify_timeout * 1000)) -u normal "muted"
+  else
+    # Use U+2589 to print the bar
+    bar=$(jot -s ▉ - 0 $((volume / 5 - 1)) | tr -d '[:digit:]')
+    ${dunstify_bin} -i $iconSound -r ${dunstify_id} -t $((notify_timeout * 1000)) -u normal "$volume    $bar"
+  fi
+}
+
+if [ ! -f ${dunstify_bin} ]; then
+  echo "dunstify not found. Install x11/dunst first!" >/dev/stderr
+  exit 1
+fi
+
+volume=$(get_volume)
+
+case $1 in
+  up)
+    set_volume +${volume_step}
+    ;;
+  down)
+    set_volume -${volume_step}
+    ;;
+  mute)
+    if is_muted; then
+      if [ -f ${oldvalue_path} ]; then
+       set_volume $(cat ${oldvalue_path}) 
+      else
+        set_volume 0 > /dev/null
+      fi
+    else
+      echo $(get_volume) > ${oldvalue_path}
+      set_volume 0 > /dev/null
+    fi
+    ;;
+  *)
+    set_volume $1
+  ;;
+esac
+
+send_notification
